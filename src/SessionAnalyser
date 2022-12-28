@@ -1,0 +1,580 @@
+#!/usr/bin/perl -W
+# SPDX-License-Identifier: AGPL-3.0-only
+
+use strict;
+use warnings;
+
+### Standard modules
+use Data::Dumper;
+use File::Basename;
+use Getopt::Long qw(:config permute);
+use POSIX qw(strftime);
+
+### Modules from cpan
+use GD; # https://metacpan.org/dist/GD
+
+my $VERSION = "1.2.1 (2022/12/22); Perl $^V; GD:$GD::VERSION; libgd:" . GD::VERSION_STRING();
+$Data::Dumper::Sortkeys = 1;
+
+# This regex defines the syntax of all commands found in a session file
+my $cmdRegExp = qr/^
+  (\d+(?:\.\d+)?)
+  \s+
+  (?:
+    (A|B|C|D)(\d{1,3}|\+|-) |
+    (J|M|O|Q|R|W)(\d+)      |
+    (H|K|L|Y)
+  )
+  \s*
+$/x;
+
+# This is the mapping for release 2.122 et later
+# This doesn't work for 2.106
+my %ModeInfo = (
+  -1 => {name=>'unknown',    C=>50, D=>50, C_NAME=>'',          D_NAME=>''           },
+   0 => {name=>'Pulse',      C=>50, D=>50, C_NAME=>'Rate',      D_NAME=>'Feel'       },
+   1 => {name=>'Bounce',     C=>50, D=>50, C_NAME=>'Rate',      D_NAME=>'Feel'       },
+   2 => {name=>'Continuous', C=>50, D=>50, C_NAME=>'Feel',      D_NAME=>''           },
+   3 => {name=>'Flo',        C=>50, D=>50, C_NAME=>'Feel-A',    D_NAME=>'Feel-B'     },
+   4 => {name=>'A Split',    C=>50, D=>50, C_NAME=>'Rate-B',    D_NAME=>'Feel'       },
+   5 => {name=>'B Split',    C=>50, D=>50, C_NAME=>'Rate-A',    D_NAME=>'Feel'       },
+   6 => {name=>'Wave',       C=>50, D=>50, C_NAME=>'Flow',      D_NAME=>'Granularity'},
+   7 => {name=>'Waterfall',  C=>50, D=>50, C_NAME=>'Flow',      D_NAME=>'Granularity'},
+   8 => {name=>'Squeeze',    C=>50, D=>50, C_NAME=>'Speed',     D_NAME=>'Feel'       },
+   9 => {name=>'Milk',       C=>50, D=>50, C_NAME=>'Speed',     D_NAME=>'Feel'       },
+  10 => {name=>'Throb',      C=>30, D=>70, C_NAME=>'Low point', D_NAME=>'High point' },
+  11 => {name=>'Thrust',     C=>30, D=>70, C_NAME=>'Low point', D_NAME=>'High point' },
+  12 => {name=>'Cycle',      C=>30, D=>70, C_NAME=>'Low point', D_NAME=>'High point' },
+  13 => {name=>'Twist',      C=>30, D=>70, C_NAME=>'Low point', D_NAME=>'High point' },
+  14 => {name=>'Random',     C=>50, D=>50, C_NAME=>'Range',     D_NAME=>'Feel'       },
+  15 => {name=>'Step',       C=>50, D=>50, C_NAME=>'Step size', D_NAME=>'Feel'       },
+  16 => {name=>'Training',   C=>50, D=>50, C_NAME=>'Jump size', D_NAME=>'Feel'       },
+  # other modes are not available in a session
+);
+
+# Default values for command line arguments
+my %opt = (
+  debug => 0,
+  height=> 355,
+  info  => 'PCDAB',
+  limit => 0,
+  width => 1500,
+);
+
+my (
+  %setup, # Hash of Hash  of Hash
+  %data,  # Hash of Array of Hash
+  $debug,
+  $duration
+);
+
+my $prgdir = dirname($0);
+
+# Parse the command line
+GetOptions (
+  \%opt,
+  '<>'         => \&ProcessFile,
+  'debug|d=i',
+  'height|h=i',
+  'help'       => \&DisplayHelp,
+  'info|i=s',
+  'limit|l=i',
+  'version|v'  => \&DisplayVersion,
+  'width|w=i',
+); # FIXME: manage errors
+
+exit(0);
+
+##############################
+### Process a session file ###
+##############################
+
+sub patch {
+  my $rtpl= shift; # ref to the template to patch
+  my $tag = shift;
+  my $val = shift;
+  ${$rtpl} =~ s/<!--$tag-->[^<]*<!---->/$val/g;
+  return;
+}
+
+sub patchStats {
+  my $tpl  = shift;  # copy of the template
+  my $mode = shift;  # -1=session
+  my $stat = shift;
+  my $m;
+  if( $mode<0 ){
+    $m = {name=>'SESSION', C_NAME=>'', D_NAME=>''};
+  }else{
+    $m = $ModeInfo{$mode};
+  }
+  patch(\$tpl, 'MODE-NAME', $m->{name});
+  patch(\$tpl, 'C-NAME',    $m->{C_NAME} =~ s/ /&nbsp;/gr);
+  patch(\$tpl, 'D-NAME',    $m->{D_NAME} =~ s/ /&nbsp;/gr);
+  for my $cmd (qw(A B C D)){
+    my $s = $stat->{$cmd};
+    patch(\$tpl, "$cmd-CPT",       $s->{cpt});
+    patch(\$tpl, "$cmd-MIN-VAL",   $s->{min_value});
+    patch(\$tpl, "$cmd-MAX-VAL",   $s->{max_value});
+    patch(\$tpl, "$cmd-MIN-VAR",   $s->{cpt} ? $s->{min_delta} : ' ');
+    patch(\$tpl, "$cmd-MAX-VAR",   $s->{cpt} ? $s->{max_delta} : ' ');
+    if( ($cmd eq 'A') || ($cmd eq 'B') ){
+      patch(\$tpl, "$cmd-USAGE",   sprintf("%.0f", $s->{time_used}));
+      patch(\$tpl, "$cmd-AVR-VAL", sprintf("%.0f", $s->{time_used} ? $s->{wsum}/$s->{time_used} : 0));
+    }
+  }
+  return $tpl;
+}
+
+sub LoadFileInMemory {
+  my $file = shift;
+  open(my $fh, '<', $file)
+    || die "ABORT: Cannot open file '$file'\n$!\n";
+  local $/ = undef;
+  return <$fh>;
+}
+
+sub ProcessFile(){
+  $debug = $opt{debug};
+
+  my $base = $opt{input} = shift;
+  $debug && printf("Config: %s\n", Dumper(\%opt) =~ s/^[^{]*//r);
+
+  $base =~ s/\.[-~\w]*$//; # Keep path and name, remove extention
+  my $imgPathName = "$base.png";  # with .jpg the image is bigger
+  my $htmlPathName= "$base.html";
+
+  my $nbrLines = AnalyseSessionFile();
+
+  my $modeStatsTpl = LoadFileInMemory("$prgdir/Template_Stats.tpl");
+
+  # Stats for the entire session
+  my $allModeStats = patchStats($modeStatsTpl, -1, $setup{session});
+
+  # Stats broken down by mode used during the session
+  for my $mode (sort {$a+0 <=> $b+0} keys %ModeInfo){
+    next unless $setup{$mode}{used};
+    $allModeStats .= patchStats($modeStatsTpl, $mode, $setup{$mode});
+  }
+
+  # Global info
+  $duration = int($duration);
+  my $hour  = int($duration / 3600);
+  my $sec   = int($duration) % 3600;
+  my $min   = int($sec/60);
+     $sec   = $sec%60;
+
+ (my $sessionName = $opt{input}) =~ s!^.*(/|\\)!!;
+
+  my $mainTpl = LoadFileInMemory("$prgdir/Template_Main.tpl");
+  patch(\$mainTpl, 'FILE-NAME',        $sessionName);
+  patch(\$mainTpl, 'FILE-SIZE',        -s $opt{input});
+  patch(\$mainTpl, 'FILE-LINES',       $nbrLines);
+  patch(\$mainTpl, 'SESSION-DURATION', "${hour}h $min\' $sec\" ($duration seconds)");
+  patch(\$mainTpl, 'EXEC-DATE',        strftime('%Y-%m-%d %H:%M:%S', localtime));
+  patch(\$mainTpl, 'EXEC-NAME',        $0);
+  patch(\$mainTpl, 'EXEC-VERS',        $VERSION);
+  patch(\$mainTpl, 'STATS',            $allModeStats);
+
+  GenerateGraph($imgPathName, \$mainTpl);  # also patch the info about scales
+
+  # Write the final html page
+  open(my $fh, '>', $htmlPathName)
+    || die "ABORT: Cannot create html file '$htmlPathName'\n$!\n";
+  print($fh $mainTpl);
+  close($fh);
+  print "Output file '$htmlPathName' generated. <-- Load this file in your browser.\n\n";
+
+  return;
+}
+
+#####################################
+### Load and analyse session file ###
+#####################################
+
+sub updateAB {
+  my $cmd = shift;  # should be 'A' or 'B' only.
+  my $mode= shift;  # the current mode
+  my $ss  = $setup{session}{$cmd};
+  my $previousValue = $ss->{current_value};
+  if( $previousValue > 0 ){   # because small values have no effect maybe we could change 0 to ~10 ?
+    my $previousTime  = $ss->{current_time};
+    my $deltaTime     = $duration - $previousTime;
+    my $wsum          = $previousValue * $deltaTime; # weighted sum
+    $ss->{wsum}      += $wsum;
+    $ss->{time_used} += $deltaTime;
+    my $sm            = $setup{$mode}{$cmd};
+    $sm->{wsum}      += $wsum;
+    $sm->{time_used} += $deltaTime;
+  }
+}
+
+sub AnalyseSessionFile {
+  open(my $input, '<', $opt{input})
+    || die "ABORT: Cannot open session file '$opt{input}'\n$!\n";
+
+  print "\nReading session file '$opt{input}'\n";
+
+  # Initial state
+  undef %setup;
+  undef %data;
+
+  $duration = 0;
+  my $currentMode = -1;
+  for my $cmd (qw(A B C D)){
+    my $value = $ModeInfo{$currentMode}{$cmd} // 0;
+    my $ss = \%{$setup{session}{$cmd}};
+    $ss->{current_time}  = $duration;
+    $ss->{current_value} = $value;
+    $ss->{max_value}     = $value;
+    $ss->{max_delta}     = 0;
+    $ss->{min_value}     = $value;
+    $ss->{min_delta}     = 100;
+    $ss->{cpt}           = 0;
+    if( ($cmd eq 'A') || ($cmd eq 'B') ){
+      $ss->{time_used}     = 0;
+      $ss->{wsum}          = 0;
+    }
+    for my $mode (keys %ModeInfo){
+      my $value = $ModeInfo{$mode}{$cmd} // 0;
+      my $sm = \%{$setup{$mode}{$cmd}};
+      $sm->{max_value} = $value;
+      $sm->{max_delta} = 0;
+      $sm->{min_value} = $value;
+      $sm->{min_delta} = 100;
+      $sm->{cpt}       = 0;
+      if( ($cmd eq 'A') || ($cmd eq 'B') ){
+        $sm->{time_used} = 0;
+        $sm->{wsum}      = 0;
+      }
+    }
+  }
+
+  # Read the session file
+
+  while (my $line=<$input>){
+    last if $opt{limit} && $. > $opt{limit};
+    chomp $line;
+    # syntax: <delay> <command>[parameter]
+    next if $line =~ /^\s*[;#]/; # skip comment
+    if( $line !~ $cmdRegExp ){
+      print "Syntax ERROR at line $.\n";
+      print "$line\n";
+      print "Exiting.\n";
+      exit;
+    }
+    my $delay = $1;
+    my $cmd   = $2 // $4 // $6;
+    my $param = $3 // $5 // '';
+    $duration += $delay;
+    $debug && printf("@%.3f %5d: %-11s = Delay(%.2f) Command(%s) Param(%s)\n", $duration, $., $line, $delay, $cmd, $param);
+
+    if ($cmd eq 'M' ){
+      # before to change the mode, update wsum of A & B for session and current mode
+      for my $cmd ('A','B'){ updateAB($cmd, $currentMode); }
+
+      # enter in the new mode
+      $currentMode = $param;
+      push @{$data{M}}, {time=>$duration, value=>$currentMode};
+      my $ss = $setup{session};
+      for my $cmd ('A','B'){
+        # set A & B to 0
+        $ss->{$cmd}{current_time}  = $duration;
+        $ss->{$cmd}{current_value} = 0;
+        push @{$data{$cmd}}, {time=>$duration, value=>0};
+      }
+      for my $cmd ('C','D'){
+        # set C & D to de default value for this mode
+        $ss->{$cmd}{current_value} = $ModeInfo{$currentMode}{$cmd};
+        push @{$data{$cmd}}, {time=>$duration, value=>$ModeInfo{$currentMode}{$cmd}};
+      }
+    }elsif( $cmd =~ /^(A|B|C|D)$/ ){
+      # track real values of A, B and C:D
+      $setup{$currentMode}{used} = 1;
+      updateAB($cmd, $currentMode) if ($cmd eq 'A') || ($cmd eq 'B');
+      my $ss = $setup{session}{$cmd};
+      my $previousValue = $ss->{current_value};
+      my $value = $param eq '+' ? $previousValue + 1
+                : $param eq '-' ? $previousValue - 1
+                : $param;
+      $value = 100 if $value>100;  ## FIXME generate warnings if out-of-band
+      $value = 0   if $value<0;
+      my $delta = $value - $previousValue;
+      $ss->{current_value} = $value;
+
+      # max & min for this channel during the session
+      $ss->{max_value} = $value if $value > $ss->{max_value};
+      $ss->{max_delta} = $delta if $delta > $ss->{max_delta};
+      $ss->{min_value} = $value if $value < $ss->{min_value};
+      $ss->{min_delta} = $delta if $delta < $ss->{min_delta};
+
+      # max & min for this channel in this mode
+      my $sm = $setup{$currentMode}{$cmd};
+      $sm->{max_value} = $value if $value > $sm->{max_value};
+      $sm->{max_delta} = $delta if $delta > $sm->{max_delta};
+      $sm->{min_value} = $value if $value < $sm->{min_value};
+      $sm->{min_delta} = $delta if $delta < $sm->{min_delta};
+
+      $ss->{current_time} = $duration;
+      $ss->{cpt} ++;
+      $sm->{cpt} ++;
+
+      $debug && printf("\t\t\t\t=> $cmd = $value delta(%+d) used(%f) $sm->{wsum}\n\n", $delta, $sm->{time_used}//-1);
+
+      push @{$data{$cmd}}, {time=>$duration, value=>$value};
+      # Keep track of all the pairs (time, value) to generate the graphic later.
+      # Note: it is not possible to generate the graphic on the fly because we don't know
+      # the global duration and this value is required to compute the scale of the x-axis.
+    }elsif( $cmd =~ /^H|L|Y$/ ){
+      # Power management
+      my $value = $cmd eq 'L' ? 1
+                : $cmd eq 'Y' ? 3
+                : $cmd eq 'H' ? 5
+                : 0;
+      push @{$data{P}}, {time=>$duration, value=>$value};
+    }else{
+      # Nothing to do (yet) for others commands
+    }
+
+  }
+
+  for my $cmd ('A','B'){ updateAB($cmd, $currentMode); }
+
+  return $.; # Number of lines read
+}
+
+##########################
+### Generate the graph ###
+##########################
+
+sub GenerateGraph {
+
+  my $imgPathName = shift;
+  my $rTpl        = shift;  # ref to the template used for the main page
+
+  my $LeftMargin  = 30;
+  my $RightMargin =  5;
+  my $TopMargin   =  5;
+  my $BottomMargin= 50;
+
+  my $GraphWidth  = $opt{width}  - $LeftMargin - $RightMargin;
+  my $GraphHeight = $opt{height} - $TopMargin  - $BottomMargin;
+
+  my $ScaleY      = $GraphHeight/100.0;  # 100 because all values are in [0..100]
+  my $ScaleX      = $GraphWidth/$duration;
+
+  my $img = GD::Image->new($opt{width},$opt{height});
+  $img->colorAllocate(127,127,127); # grey (background)
+
+  my %colors = (
+    'A' => $img->colorAllocate(0,0,255),     # blue
+    'B' => $img->colorAllocate(0,255,0),     # green
+    'C' => $img->colorAllocate(255,255,0),   # yellow
+    'D' => $img->colorAllocate(255,255,255), # white
+    'P' => $img->colorAllocate(255,0,0),     # red
+  );
+
+  my $black         = $img->colorAllocate(0,0,0);
+  my $gridColor     = $img->colorAllocate(150,150,150);
+  my $gridTextColor = $img->colorAllocate(200,200,200);
+
+  # Draw horizontal grid.
+  for my $val (100, 75, 50, 25, 0){
+    my $y = $TopMargin + (100.0-$val)*$ScaleY;
+    $img->line($LeftMargin, $y, $LeftMargin+$GraphWidth, $y, $gridColor);
+    $img->string(gdLargeFont,  $LeftMargin-28, $y-8, sprintf("%3d",$val), $gridTextColor);
+  }
+
+  # Draw a tick each minute on the X axis
+  for(my $t=0; $t<=$duration; $t+=30){
+    my $y = $TopMargin  + $GraphHeight;
+    my $x = $LeftMargin + $t * $ScaleX;
+    if( $t%60==0 ){
+      # each minute
+      $img->line($x, $y, $x, $y+10, $gridColor);
+      $img->string(gdLargeFont,  $x-4, $y+10, $t/60 . "'", $gridTextColor);
+    }else{
+      $img->line($x, $y, $x, $y+5, $gridColor);  # small tick
+    }
+  }
+
+  # Draw a vertical line when the mode is changing
+  for my $point (@{$data{M}}){
+    my $time = $point->{time};
+    my $mode = $point->{value};
+    my $x = $LeftMargin + $time * $ScaleX;
+    $img->line($x, $TopMargin, $x,   $TopMargin+$GraphHeight, $gridColor);
+    $img->string(gdSmallFont,  $x+3, $TopMargin+3, $ModeInfo{$mode}{name}, $black);
+  }
+
+  # Draw the variation of A,B,C,D and P
+  for my $cmd (qw(C D B A P)){
+    next unless $opt{info} =~ /$cmd/;
+    my $old_y = $TopMargin  + (100 - $data{$cmd}[0]{value}) * $ScaleY;
+    my $poly  = GD::Polygon->new;
+
+    for my $point (@{$data{$cmd}}){
+      my $new_x = $LeftMargin + $point->{time} * $ScaleX;
+      my $new_y = $TopMargin  + (100 - $point->{value}) * $ScaleY;
+      $poly->addPt($new_x, $old_y);  # horizontal line
+      $poly->addPt($new_x, $new_y);  # vertical line
+      $old_y = $new_y;
+    }
+
+    $poly->addPt($LeftMargin + $GraphWidth, $old_y); # Extend the line to the last event
+    $img->unclosedPolygon($poly,$colors{$cmd});      # Draw the lines
+  }
+
+  # Legend
+  my $YLegendText = $TopMargin + $GraphHeight + 30;
+  my $YLegendLine = $YLegendText + 8;
+  my $XLegendInfo = $LeftMargin;
+  my $XWidth = 80;
+  for my $cmd (qw(A B C D)){
+    next unless $opt{info} =~ /$cmd/;
+    $img->string(gdLargeFont, $XLegendInfo, $YLegendText, $cmd, $colors{$cmd});
+    $img->line( $XLegendInfo+10, $YLegendLine, $XLegendInfo + $XWidth - 32, $YLegendLine, $colors{$cmd});
+    $XLegendInfo += $XWidth,
+  }
+
+  if( $opt{info} =~ /P/ ){
+    $img->string(gdLargeFont, $XLegendInfo, $YLegendText, 'Power', $colors{'P'});
+    $img->line($XLegendInfo+40, $YLegendLine, $XLegendInfo + $XWidth - 10, $YLegendLine, $colors{'P'});
+  }
+
+  # save the image. Format depends on the extension of filename
+  $img->_file($imgPathName);
+  print "Image file '$imgPathName' generated.\n";
+
+  # Patch the main page template
+  (my $imgFileName = $imgPathName) =~ s!^.*?([^/\\]+)$!$1!; # Remove the path. html & png are in the same dir.
+  patch($rTpl, 'GRAPHPATH',  $imgFileName);
+
+  patch($rTpl, 'HEIGHT',     $opt{height});
+  patch($rTpl, 'WIDTH',      $opt{width} );
+
+  patch($rTpl, 'SCALEY',     sprintf("%3.2f", $ScaleY));
+  patch($rTpl, 'SCALEX',     sprintf("%3.2f", $ScaleX));
+
+  return;
+}
+
+##########
+## Help ##
+##########
+
+sub DisplayVersion {
+  print "$0 Version $VERSION\n";
+  exit(0);
+}
+
+sub DisplayHelp {
+  print <<HELPHERE;
+
+NAME
+
+  SessionAnalyser - a tool to analyse 2B session files generated by Commander 4
+
+SYNOPSIS
+
+  Linux:
+    SessionAnalyser [options] file [[options] file] ...
+
+  Windows:
+    perl SessionAnalyser [options] file [[options] file] ...
+
+  SessionAnalyser reads the given input session file(s) and generates html file(s)
+  showing various text and graphic information about the session(s).
+
+REQUIREMENTS
+
+  - The 2B box must run firmware 2.122 (or after)
+    and the session must be generated by Commander 4.
+
+  - This tools requires the Perl 5 interpreter and uses the Perl module 'GD' to generate png files.
+    If required, use your system packaging (yum, dnf, pacman, apt-get ...) or use cpan to install this module.
+
+OPTIONS
+
+  Note: An option affects all the session files following this option.
+        Example:  --width 1200  session1.csf session2.csf --width 2000 session3.csf
+        The images generated for sessions 1 and 2 will be 1200 pixels wide
+        but the one for session 3 will be 2000 pixels wide.
+
+--debug <integer>
+
+  Set the debug level.
+  Default is 0 (no debug).
+
+--height <integer>
+
+  Set the height of the next pictures.
+  The default value is 355 pixels.
+
+--help
+
+  Print this help message and exits.
+
+--info <string>
+
+  Defines the information to include in the picture:
+    A: Add a line for the output level of channel A.
+    B: Add a line for the output level of channel B.
+    C: Add a line for the values of C. Usualy called 'pulse rate'.
+    D: Add a line for the values of D. Usualy called 'pulse feel'.
+    P: Add a line for the values of Power level (Low, Dynamic, High).
+
+    Examples: --info ABP
+              --info ACDP
+
+    The default is ABCDP.
+
+--version
+
+  Print version information and exit.
+
+--width <integer>
+
+  Set the width of the next pictures.
+  The default value is 1200 pixels.
+
+LIMITATIONS
+
+  In this example of changes to A
+    0.23 A+
+    0.26 A+
+    0.33 A+
+    0.20 A+
+  the maximum variation is 1.
+  - It is very likely that the feeling will be one change of 4 rather than 4 changes of 1.
+    Thus, the maximum variation displayed below the graph will be 1 but you will feel 4.
+  - If the resolution on the time axis is too low (the session is too long compared to the
+    width of the picture) the graph will show a single change of 4 and not 4 changes of 1.
+    From this point of view the graph is closer to the feeling than the figures.
+
+  In this example
+    0.10 M1     ; reset A,B,C,D to 0
+    1.24 C20    ; this has no discernible effect because A & B are set to 0
+    3.87 D20    ; idem
+    2.04 C90    ; idem
+    4.91 D10    ; idem
+    8.52 A15    ; effet of C (90) and D (10) is only effective here.
+  When A & B are null the variations like D50->D20->D10 are visible in the graph
+  and contribute to the stats, but have no sensible effects as long as A & B are null.
+
+COPYRIGHT
+
+  Copyright (c) 2022 Estim4U: https://github.com/Estim4U
+  Licence AGPLv3 : GNU Affero GPL version 3 https://gnu.org/licenses/agpl-3.0.html
+  There is NO WARRANTY, to the extent permitted by applicable law.
+
+  This tool is neither endorsed, developed nor supported, in any way, by E-Stim Systems Ltd.
+
+BUG REPORT
+
+  Report bugs ONLY via github using the "Issues" or "Discussions" menus.
+
+HELPHERE
+  return;
+}
+
+__END__
